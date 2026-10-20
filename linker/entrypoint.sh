@@ -65,59 +65,26 @@ TYPES=("mangas" "comics" "web-novels" "light-novels" "webtoons")
 # Falls back to trimming whitespace only (no digit-strip) when no type
 # identifier is found — the v0.6 digit-strip fallback was the merge bug.
 sanitize_dir_name() {
+    # IMPORTANT: bash's case-pattern parser chokes on glob patterns that contain
+    # a literal space before the closing `)` — it splits "Word *" and sees the
+    # second `*` as an unexpected token. Every pattern below is checked to have
+    # NO space between the last glob char and the closing `)`.
     local name="$1"
     case "$name" in
-        *Chapter*)
-            echo "Chapter${name#*Chapter}"
-            return
-            ;;
-        *Episode*)
-            echo "Episode${name#*Episode}"
-            return
-            ;;
-        *Blank*)
-            echo "Blank${name#*Blank}"
-            return
-            ;;
-        *Volume*)
-            # Must precede *Vol* (substring match) so "Volume 1" matches here first
-            echo "Volume${name#*Volume}"
-            return
-            ;;
-        *Vol.*)
-            # "Vol. 1" -> "Volume 1" (leading space becomes separator).
-            # Also matches "Vol.1" -> "Volume1" (no separator); acceptable.
-            echo "Volume${name#*Vol.}"
-            return
-            ;;
-        *Vol*)
-            # "Vol 1" or "Vol1" (no separator) -> normalize to "Volume N"
-            echo "Volume${name#*Vol}"
-            return
-            ;;
-        *Ep.*)
-            echo "Episode${name#*Ep.}"
-            return
-            ;;
-        *Ep *)
-            # "Ep 1" (space, no dot) -> normalize to "Episode 1"
-            echo "Episode${name#*Ep }"
-            return
-            ;;
-        *Ch.*)
-            # "Ch. 1" -> normalize to "Chapter 1"
-            echo "Chapter${name#*Ch.}"
-            return
-            ;;
-        *Ch *)
-            # "Ch 1" -> normalize to "Chapter 1"
-            echo "Chapter${name#*Ch }"
-            return
-            ;;
+        *Chapter*) echo "Chapter${name#*Chapter}"; return ;;
+        *Episode*) echo "Episode${name#*Episode}"; return ;;
+        *Blank*)   echo "Blank${name#*Blank}";     return ;;
+        *Volume*)  echo "Volume${name#*Volume}";   return ;;
+        *Vol.*)    echo "Volume${name#*Vol.}";     return ;;  # Vol. 1 -> "Volume 1"
+        *Vol*)     echo "Volume${name#*Vol}";      return ;;  # Vol 1 -> "Volume 1"
+        *Ep.*)     echo "Episode${name#*Ep.}";     return ;;  # Ep. 1 -> "Episode 1"
+        *Ep*)      echo "Episode${name#*Ep}";      return ;;  # Ep 1 -> "Episode 1"
+        *Ch.*)     echo "Chapter${name#*Ch.}";     return ;;  # Ch. 1 -> "Chapter 1"
+        *Ch*)      echo "Chapter${name#*Ch}";      return ;;  # Ch 1 -> "Chapter 1"
     esac
     # No chapter type identifier found — leave name as-is, just trim whitespace.
-    # (Avoids the v0.6 bug where digit-strip merged all chapters of a series
-    # into one dst folder.)
+    # (The old v0.6 digit-strip fallback merged all chapters of a series into
+    # one dst folder, so we never strip digits here.)
     echo "$name" | tr -s ' ' | sed -e 's/^ *//' -e 's/ *$//'
 }
 
