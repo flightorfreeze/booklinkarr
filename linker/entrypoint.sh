@@ -37,6 +37,24 @@ DST_ROOT="${DST_ROOT:-/target}"
 SCAN_INTERVAL="${SCAN_INTERVAL:-600}"
 TYPES=("mangas" "comics" "web-novels" "light-novels" "webtoons")
 
+# === Per-book scan cache (fast path) ===
+# Cache files live at $STAT_CACHE_DIR/<dst>.cache (one per book). The file's
+# mtime marks the last sync time. A "cache hit" in sync_series means the cache
+# file exists, is younger than STAT_CACHE_MAX_AGE, and no source file is newer
+# than the cache file — in which case we skip the per-file iteration entirely.
+#
+# What this catches (triggers slow path):
+#   - New chapter folders added (a file inside has newer mtime)
+#   - In-chapter file modifications or additions (newer mtime)
+#
+# What this does NOT catch (cache hits, relies on PURGE_ORPHANS for safety):
+#   - Source deletions (file count drops; mtime unchanged)
+#   - File additions with manually-preserved old mtimes (e.g., `cp -p`)
+# PURGE_ORPHANS catches orphan dst files via inode comparison on every rescan,
+# so a stale cache hit doesn't cause permanent data drift.
+STAT_CACHE_DIR="${CACHE_DIR:-/var/lib/booklinkarr}/scan_cache"
+STAT_CACHE_MAX_AGE="${STAT_CACHE_MAX_AGE:-604800}"  # 7 days, safety net
+
 # === Path sanitization (Kavita parser compat + chapter rename) ===
 # Two separate functions because book names and chapter names want different
 # transforms:
@@ -179,6 +197,24 @@ sync_series() {
     local src="$1" dst="$2"
 
     [ ! -d "$src" ] && return 0
+
+    # === FAST PATH: skip per-file iteration if src hasn't changed since last sync ===
+    # Cache file mtime marks the last sync time. If no source file is newer than
+    # that, nothing changed since last sync and we can skip the per-file loop.
+    # What this catches (slow path): new chapter folders, in-chapter file mods.
+    # What it misses (cache hit): src deletions → caught by PURGE_ORPHANS instead.
+    local cache_file="$STAT_CACHE_DIR/$(printf '%s' "$dst" | tr '/' '_').cache"
+    if [ -f "$cache_file" ]; then
+        local cache_age=$(( $(date +%s) - $(stat -c %Y "$cache_file") ))
+        if [ "$cache_age" -le "$STAT_CACHE_MAX_AGE" ] && \
+           [ -z "$(find "$src" -newer "$cache_file" -type f -print -quit 2>/dev/null)" ]; then
+            if should_log_skip "$dst"; then
+                log_info "✓ Cache hit: $dst"
+            fi
+            return 0
+        fi
+    fi
+
     mkdir -p "$dst"
 
     mapfile -t src_files < <(find "$src" -type f 2>/dev/null)
@@ -242,6 +278,12 @@ sync_series() {
     else
         log_warn "⚠️  Partial sync: $dst — linked=$linked failed=$failed (total=$total)"
     fi
+
+    # Update scan cache (mtime = now; next rescan uses this for fast-path check).
+    # We touch on every slow-path completion regardless of outcome — even "partial"
+    # syncs have progressed past the previous sync point, so the cache is correct.
+    mkdir -p "$STAT_CACHE_DIR"
+    touch "$cache_file"
     return 0
 }
 
