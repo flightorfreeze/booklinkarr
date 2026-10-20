@@ -38,20 +38,34 @@ SCAN_INTERVAL="${SCAN_INTERVAL:-600}"
 TYPES=("mangas" "comics" "web-novels" "light-novels" "webtoons")
 
 # === Path sanitization (Kavita parser compat + chapter rename) ===
-# Two goals:
-#   1) Avoid Kavita's parser bug for series with digits in the title. The parser
-#      extracts digits and treats them as chapter numbers — "The Archmage Returns
-#      After 4000 Years" gets parsed as chapter 4000 with 3999 phantom predecessors.
-#      Strips digits from the BOOK folder name to dodge this (the book folder
-#      rename doesn't affect chapter identity).
-#   2) Strip the scanlator/series prefix from CHAPTER folder names while keeping
-#      the chapter TYPE identifier (Chapter, Episode, Blank, Ep.) and number.
-#      Example: "Atsumaru (EN)_Devil Butler_Episode 5" -> "Episode 5"
-#      This keeps each chapter uniquely addressable in dst (without this, all
-#      301 episodes sanitized to the same string and merged into one folder).
-# Filenames are NOT sanitized (file extensions and numeric ordering preserved).
-# Strip scanlator/series prefix while preserving the chapter TYPE identifier
-# and normalizing abbreviations. Recognized types (full → dst form):
+# Two separate functions because book names and chapter names want different
+# transforms:
+#   - BOOK folder names get digits stripped (Kavita's parser extracts digits
+#     from folder names and treats them as chapter numbers — "The Archmage
+#     Returns After 4000 Years" would be parsed as chapter 4000 with 3999
+#     phantom predecessors).
+#   - CHAPTER folder names get the scanlator/series prefix stripped but keep
+#     the chapter TYPE identifier and number (Chapter N, Episode N, Blank N,
+#     Volume N, plus abbreviation normalizations).
+#
+# Filenames are NOT sanitized (extensions and numeric ordering preserved).
+#
+# Booklinkarr must NEVER create an unsanitized dst directory for a book or
+# chapter — that would orphan the existing dst and silently double the library.
+
+# Sanitize a BOOK folder name: strip digits to dodge Kavita's parser bug.
+# "The Archmage Returns After 4000 Years" -> "The Archmage Returns After Years"
+sanitize_book_name() {
+    local name="$1"
+    if [ -z "$name" ]; then
+        echo "unknown_series"
+        return
+    fi
+    echo "$name" | tr -d '0-9' | tr -s ' ' | sed -e 's/^ *//' -e 's/ *$//'
+}
+
+# Sanitize a CHAPTER folder name: strip scanlator/series prefix while preserving
+# the chapter TYPE identifier. Recognized types (full → dst form):
 #   Chapter       -> Chapter N
 #   Episode       -> Episode N
 #   Blank         -> Blank N
@@ -63,7 +77,7 @@ TYPES=("mangas" "comics" "web-novels" "light-novels" "webtoons")
 # This keeps each chapter uniquely addressable in dst (without it, all 301
 # episodes sanitized to the same string and merged into one folder).
 # Falls back to trimming whitespace only (no digit-strip) when no type
-# identifier is found — the v0.6 digit-strip fallback was the merge bug.
+# identifier is found — the digit-strip fallback was the Devil Butler merge bug.
 sanitize_dir_name() {
     # IMPORTANT: bash's case-pattern parser chokes on glob patterns that contain
     # a literal space before the closing `)` — it splits "Word *" and sees the
@@ -83,8 +97,6 @@ sanitize_dir_name() {
         *Ch*)      echo "Chapter${name#*Ch}";      return ;;  # Ch 1 -> "Chapter 1"
     esac
     # No chapter type identifier found — leave name as-is, just trim whitespace.
-    # (The old v0.6 digit-strip fallback merged all chapters of a series into
-    # one dst folder, so we never strip digits here.)
     echo "$name" | tr -s ' ' | sed -e 's/^ *//' -e 's/ *$//'
 }
 
@@ -243,13 +255,11 @@ scan_type() {
     for book_dir in "${book_dirs[@]}"; do
         local book_name
         book_name=$(basename "$book_dir")
-        # Sanitize the book folder name so dest paths don't trigger Kavita's parser.
-        # Source keeps original (Suwayomi is the source of truth), dest is sanitized.
+        # Sanitize the BOOK folder name (strips digits to avoid Kavita's parser
+        # bug). Source keeps original (Suwayomi is the source of truth); dest is
+        # sanitized. sanitize_book_name returns "unknown_series" for empty input.
         local dest_book_name
-        dest_book_name=$(sanitize_dir_name "$book_name")
-        if [ -z "$dest_book_name" ]; then
-            dest_book_name="unknown_series"
-        fi
+        dest_book_name=$(sanitize_book_name "$book_name")
         local dst_book="$DST_ROOT/$type/$dest_book_name"
         sync_series "$book_dir" "$dst_book"
     done
@@ -533,13 +543,12 @@ start_watch() {
                 fi
                 local book_name
                 book_name=$(basename "$book_dir")
-                # Sanitize book name (same logic as scan_type) so inotify-triggered syncs
-                # write to the same dest path as the periodic rescan.
+                # Sanitize BOOK name (digits stripped) so inotify-triggered syncs
+                # write to the same dest path as the periodic rescan. Without this,
+                # "The Archmage Returns After 4000 Years" would be created as a
+                # new unsanitized folder, orphaning the existing "After Years" one.
                 local dest_book_name
-                dest_book_name=$(sanitize_dir_name "$book_name")
-                if [ -z "$dest_book_name" ]; then
-                    dest_book_name="unknown_series"
-                fi
+                dest_book_name=$(sanitize_book_name "$book_name")
                 local dst_book="$DST_ROOT/$type_label/$dest_book_name"
                 sync_series "$book_dir" "$dst_book"
             fi
