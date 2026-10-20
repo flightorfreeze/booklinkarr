@@ -51,13 +51,19 @@ TYPES=("mangas" "comics" "web-novels" "light-novels" "webtoons")
 #      301 episodes sanitized to the same string and merged into one folder).
 # Filenames are NOT sanitized (file extensions and numeric ordering preserved).
 # Strip scanlator/series prefix while preserving the chapter TYPE identifier
-# (Chapter, Episode, Blank, Ep.). For a name like
-#   "Atsumaru (EN)_The Devil Butler_Alpha_Episode 5"
-# this returns "Episode 5" — keeping the chapter number distinct so 301 episodes
-# don't all sanitize to the same string and merge into one dst folder.
+# and normalizing abbreviations. Recognized types (full → dst form):
+#   Chapter       -> Chapter N
+#   Episode       -> Episode N
+#   Blank         -> Blank N
+#   Volume        -> Volume N
+#   Vol / Vol.    -> Volume N      (abbreviation normalized)
+#   Ep. / Ep      -> Episode N     (abbreviation normalized)
+#   Ch. / Ch      -> Chapter N     (abbreviation normalized)
+# Example: "Atsumaru (EN)_The Devil Butler_Alpha_Episode 5" -> "Episode 5"
+# This keeps each chapter uniquely addressable in dst (without it, all 301
+# episodes sanitized to the same string and merged into one folder).
 # Falls back to trimming whitespace only (no digit-strip) when no type
-# identifier is found, since stripping digits from "Episode 300" was what caused
-# the merge bug.
+# identifier is found — the v0.6 digit-strip fallback was the merge bug.
 sanitize_dir_name() {
     local name="$1"
     case "$name" in
@@ -73,8 +79,39 @@ sanitize_dir_name() {
             echo "Blank${name#*Blank}"
             return
             ;;
+        *Volume*)
+            # Must precede *Vol* (substring match) so "Volume 1" matches here first
+            echo "Volume${name#*Volume}"
+            return
+            ;;
+        *Vol.*)
+            # "Vol. 1" -> "Volume 1" (leading space becomes separator).
+            # Also matches "Vol.1" -> "Volume1" (no separator); acceptable.
+            echo "Volume${name#*Vol.}"
+            return
+            ;;
+        *Vol*)
+            # "Vol 1" or "Vol1" (no separator) -> normalize to "Volume N"
+            echo "Volume${name#*Vol}"
+            return
+            ;;
         *Ep.*)
-            echo "Ep.${name#*Ep.}"
+            echo "Episode${name#*Ep.}"
+            return
+            ;;
+        *Ep *)
+            # "Ep 1" (space, no dot) -> normalize to "Episode 1"
+            echo "Episode${name#*Ep }"
+            return
+            ;;
+        *Ch.*)
+            # "Ch. 1" -> normalize to "Chapter 1"
+            echo "Chapter${name#*Ch.}"
+            return
+            ;;
+        *Ch *)
+            # "Ch 1" -> normalize to "Chapter 1"
+            echo "Chapter${name#*Ch }"
             return
             ;;
     esac
