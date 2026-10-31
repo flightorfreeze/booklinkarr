@@ -55,6 +55,13 @@ TYPES=("mangas" "comics" "web-novels" "light-novels" "webtoons")
 STAT_CACHE_DIR="${CACHE_DIR:-/var/lib/booklinkarr}/scan_cache"
 STAT_CACHE_MAX_AGE="${STAT_CACHE_MAX_AGE:-604800}"  # 7 days, safety net
 
+# === Corrupt / empty file detection ===
+# When enabled, a chapter whose files look corrupt (truncated, wrong magic
+# bytes) or empty is NOT linked at all and an error is logged, so the gap is
+# visible in the library and the user knows to re-download that chapter.
+# Checks run only for chapters that are about to be linked.
+VALIDATE_FILES="${VALIDATE_FILES:-1}"
+
 # === Path sanitization (Kavita parser compat + chapter rename) ===
 # Two separate functions because book names and chapter names want different
 # transforms:
@@ -116,6 +123,500 @@ sanitize_dir_name() {
     esac
     # No chapter type identifier found — leave name as-is, just trim whitespace.
     echo "$name" | tr -s ' ' | sed -e 's/^ *//' -e 's/ *$//'
+}
+
+# === Chapter folder name parsing (per-book) ===
+#
+# Source chapter folder names look like:
+#   "Atsumaru (EN)_Jungle Juice_Alpha_Episode 12 S2"
+#   "Atsumaru (EN)_Jungle Juice_Alpha_Spin-off 1"
+#   "Atsumaru (EN)_Jungle Juice_Delta_Chapter 321"
+#
+# We extract the type word, the chapter number (may be decimal), a trailing
+# season marker, and the "residual" text (everything that is neither the type
+# word nor the number). The residual's word count is what tells a canonical
+# chapter apart from a side story that happens to carry the same number.
+
+# Chapter type keywords, matched in this order (first match wins). A keyword
+# only counts as a type when a number follows it.
+CH_KW=("Side Story" "Spin-off" "Bonus" "Omake" "Special" "Extra"
+       "Chapter" "Episode" "Blank" "Volume"
+       "Vol." "Vol " "Ep." "Ep " "Ch." "Ch ")
+# Canonical destination name for each keyword.
+CH_CANON=("Side Story" "Spin-off" "Bonus" "Omake" "Special" "Extra"
+           "Chapter" "Episode" "Blank" "Volume"
+           "Volume" "Volume" "Episode" "Episode" "Chapter" "Chapter")
+# 1 = the keyword marks a side story rather than a main-sequence chapter.
+CH_SIDE=(1 1 1 1 1 1 0 0 0 0 0 0 0 0 0 0)
+
+# Parse results (globals).
+CH_TYPE=""
+CH_NUM=""
+CH_SEASON=""
+CH_FRAC=""
+CH_RESIDUAL=""
+CH_SIDESTORY=0
+CH_WORDS=0
+
+# Parse a chapter folder name into the globals above.
+parse_chapter_name() {
+    local name="$1"
+    local work="$name"
+
+    CH_TYPE=""
+    CH_NUM=""
+    CH_SEASON=""
+    CH_FRAC=""
+    CH_RESIDUAL="$name"
+    CH_SIDESTORY=0
+    CH_WORDS=0
+
+    # --- season marker (must be a trailing token) ---
+    if [[ "$work" =~ ^(.*)[[:space:]_]+Season[[:space:]_.]*([0-9]+)$ ]]; then
+        CH_SEASON="${BASH_REMATCH[2]}"
+        work="${BASH_REMATCH[1]}"
+    elif [[ "$work" =~ ^(.*)[[:space:]_]+S[[:space:]_.]*([0-9]+)$ ]]; then
+        CH_SEASON="${BASH_REMATCH[2]}"
+        work="${BASH_REMATCH[1]}"
+    fi
+
+    # --- type keyword plus the number that follows it ---
+    local i kw after before sep int frac rem off
+    for i in "${!CH_KW[@]}"; do
+        kw="${CH_KW[$i]}"
+        case "$work" in
+            *"$kw"*) ;;
+            *) continue ;;
+        esac
+        after="${work#*"$kw"}"
+        if [[ "$after" =~ ^([[:space:]_.-]*)([0-9]+)(\.[0-9]+)? ]]; then
+            sep="${BASH_REMATCH[1]}"
+            int="${BASH_REMATCH[2]}"
+            frac="${BASH_REMATCH[3]}"
+            before="${work%*"$kw"*}"
+            off=$(( ${#sep} + ${#int} + ${#frac} ))
+            rem="${after:$off}"
+            CH_TYPE="${CH_CANON[$i]}"
+            CH_NUM="$int"
+            CH_FRAC=""
+            if [ -n "$frac" ]; then
+                CH_NUM="$int$frac"
+                CH_FRAC="${frac#*.}"
+            fi
+            CH_SIDESTORY="${CH_SIDE[$i]}"
+            CH_RESIDUAL="$before$rem"
+            CH_WORDS=$(printf '%s' "$CH_RESIDUAL" | wc -w)
+            return 0
+        fi
+    done
+
+    # No recognised type keyword. Keep the bare number if the name ends in one
+    # (e.g. "Atsumaru (EN)_Black Butler_87" -> number 87).
+    if [[ "$work" =~ ([0-9]+)(\.[0-9]+)?$ ]]; then
+        int="${BASH_REMATCH[1]}"
+        frac="${BASH_REMATCH[2]}"
+        CH_NUM="$int"
+        CH_FRAC=""
+        if [ -n "$frac" ]; then
+            CH_NUM="$int$frac"
+            CH_FRAC="${frac#*.}"
+        fi
+        CH_TYPE=""
+        CH_RESIDUAL="$work"
+        CH_WORDS=$(printf '%s' "$CH_RESIDUAL" | wc -w)
+    fi
+    return 0
+}
+
+# === Per-book chapter map ===
+# Built once per book, before the per-file loop.
+#
+#   CHAP_DST[<src chapter dir name>]   = destination path relative to the book dst
+#   CHAP_SKIP[<src chapter dir name>]  = "1" if the chapter is superseded and skipped
+declare -A CHAP_DST
+declare -A CHAP_SKIP
+
+# Build the chapter map for one book directory.
+build_chapter_map() {
+    local src="$1"
+
+    CHAP_DST=()
+    CHAP_SKIP=()
+
+    local -a nm=() ty=() num=() sea=() frc=() sid=() wrd=() mtm=()
+    local n=0 dir name i
+
+    while IFS= read -r dir; do
+        name=$(basename "$dir")
+        parse_chapter_name "$name"
+        nm[$n]="$name"
+        ty[$n]="$CH_TYPE"
+        num[$n]="$CH_NUM"
+        sea[$n]="$CH_SEASON"
+        frc[$n]="$CH_FRAC"
+        sid[$n]="$CH_SIDESTORY"
+        wrd[$n]="$CH_WORDS"
+        mtm[$n]=$(stat -c %Y "$dir" 2>/dev/null || echo 0)
+        n=$((n + 1))
+    done < <(find "$src" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
+
+    [ "$n" -eq 0 ] && return 0
+
+    # --- per-book type normalisation: Chapter vs Episode ---
+    # If a series mixes the two, the whole series adopts the more prevalent one.
+    local c_chapter=0 c_episode=0 canon_type=""
+    for ((i = 0; i < n; i++)); do
+        case "${ty[$i]}" in
+            Chapter) c_chapter=$((c_chapter + 1)) ;;
+            Episode) c_episode=$((c_episode + 1)) ;;
+        esac
+    done
+    if [ "$c_chapter" -gt 0 ] && [ "$c_episode" -gt 0 ]; then
+        if [ "$c_chapter" -ge "$c_episode" ]; then
+            canon_type="Chapter"
+        else
+            canon_type="Episode"
+        fi
+        for ((i = 0; i < n; i++)); do
+            case "${ty[$i]}" in
+                Chapter|Episode) ty[$i]="$canon_type" ;;
+            esac
+        done
+    fi
+
+    # --- regime: does the book carry any season markers? ---
+    local has_season=0 min_season=0
+    for ((i = 0; i < n; i++)); do
+        if [ -n "${sea[$i]}" ]; then
+            has_season=1
+            if [ "$min_season" -eq 0 ] || [ "${sea[$i]}" -lt "$min_season" ]; then
+                min_season="${sea[$i]}"
+            fi
+        fi
+    done
+
+    # --- destination season and ordering bucket for each chapter ---
+    # bucket 0 = prologue (chapter 0), 1 = main sequence, 2 = tail (unseasoned),
+    # 3 = tail (side story).
+    local -a dsea=() bucket=()
+    for ((i = 0; i < n; i++)); do
+        local s=0 b=2
+        if [ -n "${num[$i]}" ] && [ "${num[$i]%%.*}" = "0" ]; then
+            b=0
+            if [ "$has_season" -eq 1 ]; then s=1; fi
+        elif [ -n "${sea[$i]}" ]; then
+            s="${sea[$i]}"
+            b=1
+        elif [ "$has_season" -eq 1 ] && [ "$min_season" -gt 1 ]; then
+            # Seasons start above 1 — unseasoned chapters fill the gap.
+            s=1
+            b=1
+        fi
+        if [ "${sid[$i]}" = "1" ]; then
+            b=3
+            s=0
+        fi
+        dsea[$i]=$s
+        bucket[$i]=$b
+    done
+
+    # --- sort keys ---
+    local -a keys=()
+    for ((i = 0; i < n; i++)); do
+        local int="${num[$i]%%.*}"
+        local fr="${frc[$i]}"
+        if [ -z "$int" ]; then int=0; fi
+        if [ -z "$fr" ]; then fr=0; fi
+        keys[$i]=$(printf '%01d%04d%08d%03d\t%06d' \
+            "${bucket[$i]}" "${dsea[$i]}" "$int" "$fr" "$i")
+    done
+
+    local -a sorted=()
+    mapfile -t sorted < <(printf '%s\n' "${keys[@]}" | LC_ALL=C sort)
+
+    # --- how many distinct seasons (decides whether we nest under Season N/) ---
+    local season_count=0
+    local -A seen_season=()
+    for ((i = 0; i < n; i++)); do
+        local sv="${sea[$i]}"
+        if [ -n "$sv" ] && [ -z "${seen_season[$sv]:-}" ]; then
+            seen_season["$sv"]=1
+            season_count=$((season_count + 1))
+        fi
+    done
+    local nested=0
+    if [ "$season_count" -ge 2 ]; then nested=1; fi
+
+    # --- assign destinations ---
+    # In a book with seasons every chapter is renumbered into one global
+    # sequence; without seasons the source numbers are preserved and only
+    # collisions are resolved.
+    local counter=0
+    local -a dest=() skip=()
+    local idx=0 group_end winner loser
+    local gkey gi w c
+
+    while [ "$idx" -lt "$n" ]; do
+        # The sort key zero-pads the index ("000008"), and bash would read a
+        # leading zero as OCTAL when the value is used as an array subscript —
+        # and "8" is not a valid octal digit. 10# forces base 10.
+        gi="${sorted[$idx]##*$'\t'}"
+        gi=$((10#${gi:-0}))
+        # The bucket is part of the group key so that two chapters with the same
+        # number but in different buckets (e.g. "Episode 5" and "Spin-off 5")
+        # never get merged into one group.
+        gkey="${bucket[$gi]}|${dsea[$gi]}|${num[$gi]}"
+
+        # Collect the group (adjacent entries share bucket + season + number).
+        group_end=$idx
+        winner=$gi
+        while [ "$group_end" -lt "$n" ]; do
+            gi="${sorted[$group_end]##*$'\t'}"
+            gi=$((10#${gi:-0}))
+            if [ "${bucket[$gi]}|${dsea[$gi]}|${num[$gi]}" != "$gkey" ]; then break; fi
+            if [ "$group_end" -gt "$idx" ]; then
+                w="${wrd[$winner]}"
+                c="${wrd[$gi]}"
+                if [ "$c" -lt "$w" ]; then
+                    winner=$gi
+                elif [ "$c" -eq "$w" ]; then
+                    if [ "${mtm[$gi]}" -gt "${mtm[$winner]}" ]; then
+                        winner=$gi
+                    elif [ "${mtm[$gi]}" -eq "${mtm[$winner]}" ] &&
+                         [ "${nm[$gi]}" \< "${nm[$winner]}" ]; then
+                        winner=$gi
+                    fi
+                fi
+            fi
+            group_end=$((group_end + 1))
+        done
+
+        # Assign the group's number.
+        # A decimal chapter (83.5) hangs off the preceding integer and does not
+        # advance the counter, so 83, 83.5, 84 stay 83, 83.5, 84.
+        local assigned=""
+        if [ "$has_season" -eq 1 ]; then
+            local frac="${frc[$winner]}"
+            local int="${num[$winner]%%.*}"
+            if [ -n "$int" ] && [ "$int" = "0" ]; then
+                # Prologue: chapter 0, counter stays at 0.
+                assigned="$counter"
+                if [ -n "$frac" ]; then assigned="$counter.$frac"; fi
+            elif [ -n "$frac" ]; then
+                assigned="$counter.$frac"
+            else
+                counter=$((counter + 1))
+                assigned="$counter"
+            fi
+        else
+            assigned="${num[$winner]}"
+        fi
+
+        # The winner takes the destination; the others are either superseded
+        # (same chapter from another scanlator) or demoted to a side story
+        # (a different chapter that carried the same number).
+        local wtype="${ty[$winner]}"
+        local dpath=""
+        if [ -n "$wtype" ]; then
+            dpath="$wtype $assigned"
+        else
+            dpath="$assigned"
+        fi
+        if [ "$nested" -eq 1 ] && [ "${dsea[$winner]}" != "0" ]; then
+            dpath="Season ${dsea[$winner]}/$dpath"
+        fi
+        dest[$winner]="$dpath"
+
+        # Losers.
+        local l
+        for ((l = idx; l < group_end; l++)); do
+            if [ "$l" -eq "$idx" ]; then continue; fi
+            gi="${sorted[$l]##*$'\t'}"
+            gi=$((10#${gi:-0}))
+            if [ "$gi" = "$winner" ]; then continue; fi
+            if [ "${wrd[$gi]}" -gt "${wrd[$winner]}" ]; then
+                # More descriptive than the canonical chapter -> side story.
+                skip[$gi]=2
+            else
+                # Same shape -> the same chapter from another scanlator.
+                skip[$gi]=1
+            fi
+        done
+
+        idx=$group_end
+    done
+
+    # --- side stories get their numbers appended at the end of the book ---
+    # The highest number already in use, taken from the source numbers (an
+    # unseasoned book preserves them).
+    local max_assigned=0
+    for ((i = 0; i < n; i++)); do
+        local v="${num[$i]%%.*}"
+        if [ -n "$v" ] && [ "$v" -gt "$max_assigned" ] 2>/dev/null; then
+            max_assigned="$v"
+        fi
+    done
+    local side_count=0
+    for ((i = 0; i < n; i++)); do
+        if [ "${skip[$i]:-}" = "2" ]; then side_count=$((side_count + 1)); fi
+    done
+    if [ "$has_season" -eq 1 ]; then
+        # Seasoned books: side stories take the next numbers after the sequence.
+        for ((i = 0; i < n; i++)); do
+            [ "${skip[$i]:-}" = "2" ] || continue
+            counter=$((counter + 1))
+            local st="${ty[$i]}"
+            local sp="$counter"
+            if [ -n "$st" ]; then
+                dest[$i]="$st $sp"
+            else
+                dest[$i]="$sp"
+            fi
+            skip[$i]=0
+        done
+    else
+        # Unseasoned books: side stories continue past the highest number used.
+        for ((i = 0; i < n; i++)); do
+            [ "${skip[$i]:-}" = "2" ] || continue
+            max_assigned=$((max_assigned + 1))
+            local st="${ty[$i]}"
+            local sp="$max_assigned"
+            if [ -n "$st" ]; then
+                dest[$i]="$st $sp"
+            else
+                dest[$i]="$sp"
+            fi
+            skip[$i]=0
+        done
+    fi
+
+    # --- publish the map ---
+    for ((i = 0; i < n; i++)); do
+        # Publish the skip flag first: a superseded chapter has no destination
+        # of its own, so the "continue" below would otherwise drop the flag.
+        if [ "${skip[$i]:-}" = "1" ]; then
+            CHAP_SKIP["${nm[$i]}"]=1
+        fi
+        local d="${dest[$i]:-}"
+        if [ -z "$d" ]; then continue; fi
+        CHAP_DST["${nm[$i]}"]="$d"
+    done
+    return 0
+}
+
+# Map a source-relative directory path to its destination-relative path.
+# The first path component is the chapter folder and comes from the map; any
+# deeper components are sanitized individually.
+map_rel_dir() {
+    local rel_dir="$1"
+    local first="${rel_dir%%/*}"
+    local mapped="${CHAP_DST["$first"]:-}"
+    if [ -z "$mapped" ]; then
+        mapped="$(sanitize_dir_name "$first")"
+    fi
+    if [ "$rel_dir" = "$first" ]; then
+        echo "$mapped"
+    else
+        echo "$mapped/$(sanitize_path "${rel_dir#*/}")"
+    fi
+}
+
+# === Corrupt / empty file detection ===
+# Returns 0 when every file in the chapter looks sound, 1 otherwise.
+validate_chapter_files() {
+    local dir="$1" book="$2" name="$3"
+
+    [ "${VALIDATE_FILES:-1}" -eq 1 ] || return 0
+    [ -d "$dir" ] || return 0
+
+    local f size hex riff bad_count=0
+    local -a bad=()
+
+    while IFS= read -r -d '' f; do
+        size=$(stat -c %s "$f" 2>/dev/null || echo 0)
+        if [ "$size" -eq 0 ]; then
+            bad+=("empty file ($f)")
+            bad_count=$((bad_count + 1))
+            continue
+        fi
+        case "$f" in
+            *.webp|*.WEBP)
+                # od -N12 gives 12 bytes = 24 hex chars. Layout:
+                #   bytes 0-3  "RIFF"   -> hex 0-7
+                #   bytes 4-7  size    -> hex 8-15
+                #   bytes 8-11 "WEBP"  -> hex 16-23
+                hex=$(od -An -tx1 -N12 "$f" 2>/dev/null | tr -d ' \n' || echo "")
+                if [ "${hex:0:8}" != "52494646" ] || [ "${hex:16:8}" != "57454250" ]; then
+                    bad+=("not a WebP file ($f)")
+                    bad_count=$((bad_count + 1))
+                else
+                    # The RIFF size field is LITTLE-endian, so the four bytes
+                    # have to be reversed before reading them as a number.
+                    # (bytes 4-7 = 04 00 00 00 means 4, not 67108864)
+                    riff=0
+                    if [ "${#hex}" -ge 16 ]; then
+                        riff=$((16#${hex:14:2}${hex:12:2}${hex:10:2}${hex:8:2})) 2>/dev/null || riff=0
+                    fi
+                    if [ $((riff + 8)) -ne "$size" ]; then
+                        bad+=("truncated WebP, declares $((riff + 8)) bytes but is $size ($f)")
+                        bad_count=$((bad_count + 1))
+                    fi
+                fi
+                ;;
+            *.avif|*.AVIF)
+                hex=$(od -An -tx1 -N12 "$f" 2>/dev/null | tr -d ' \n' || echo "")
+                if [ "${hex:8:8}" != "66747970" ]; then
+                    bad+=("not an AVIF file ($f)")
+                    bad_count=$((bad_count + 1))
+                fi
+                ;;
+            *.jpg|*.JPG|*.jpeg|*.JPEG)
+                hex=$(od -An -tx1 -N4 "$f" 2>/dev/null | tr -d ' \n' || echo "")
+                if [ "${hex:0:4}" != "ffd8" ]; then
+                    bad+=("not a JPEG file ($f)")
+                    bad_count=$((bad_count + 1))
+                fi
+                ;;
+            *.png|*.PNG)
+                hex=$(od -An -tx1 -N8 "$f" 2>/dev/null | tr -d ' \n' || echo "")
+                if [ "${hex:0:16}" != "89504e470d0a1a0a" ]; then
+                    bad+=("not a PNG file ($f)")
+                    bad_count=$((bad_count + 1))
+                fi
+                ;;
+            *.gif|*.GIF)
+                hex=$(od -An -tx1 -N4 "$f" 2>/dev/null | tr -d ' \n' || echo "")
+                if [ "${hex:0:6}" != "474946" ]; then
+                    bad+=("not a GIF file ($f)")
+                    bad_count=$((bad_count + 1))
+                fi
+                ;;
+            *.pdf|*.PDF)
+                hex=$(od -An -tx1 -N4 "$f" 2>/dev/null | tr -d ' \n' || echo "")
+                if [ "${hex:0:8}" != "25504446" ]; then
+                    bad+=("not a PDF file ($f)")
+                    bad_count=$((bad_count + 1))
+                fi
+                ;;
+            *.cbz|*.CBZ|*.cbr|*.CBR|*.zip|*.ZIP|*.epub|*.EPUB)
+                hex=$(od -An -tx1 -N2 "$f" 2>/dev/null | tr -d ' \n' || echo "")
+                if [ "${hex:0:4}" != "504b" ]; then
+                    bad+=("not a ZIP archive ($f)")
+                    bad_count=$((bad_count + 1))
+                fi
+                ;;
+        esac
+    done < <(find "$dir" -type f -print0 2>/dev/null)
+
+    if [ "$bad_count" -gt 0 ]; then
+        log_error "Corrupt chapter — not linking: $book / $name ($bad_count bad file(s))"
+        local b
+        for b in "${bad[@]}"; do
+            log_error "    $b"
+        done
+        return 1
+    fi
+    return 0
 }
 
 # Sanitize a path's directory portion (each /-separated component).
@@ -217,6 +718,17 @@ sync_series() {
 
     mkdir -p "$dst"
 
+    # Stamp the cache with the time this scan started, not the time it ends and
+    # not the newest source file's mtime. A file that arrives WHILE this scan
+    # is running then still has a newer mtime than the cache, so the next scan
+    # picks it up instead of skipping it forever.
+    local scan_start
+    scan_start=$(date +%s)
+
+    # Build the per-book chapter map: decides each chapter's destination path,
+    # handles season renumbering, side stories and chapter replacement.
+    build_chapter_map "$src"
+
     mapfile -t src_files < <(find "$src" -type f 2>/dev/null)
 
     local total=${#src_files[@]}
@@ -224,20 +736,71 @@ sync_series() {
     local progress_interval=500
     local last_progress=0
     local syncing_logged=0
+    local -A seen_chapter=()
 
     for src_file in "${src_files[@]}"; do
         local rel="${src_file#$src/}"
 
         # Split into dir portion (sanitize) and file portion (keep as-is).
-        # sanitize_path strips digits from directory names but leaves filenames alone
-        # so "001.webp" stays as "001.webp" (no extension loss / no collisions).
+        # The chapter folder part comes from the chapter map so that seasons and
+        # side stories land where they should. Filenames are left alone so
+        # "001.webp" stays as "001.webp" (no extension loss / no collisions).
         local rel_dir rel_file
         rel_dir=$(dirname "$rel")
         rel_file=$(basename "$rel")
 
+        # The first path component is the chapter folder.
+        local chap=""
+        if [ "$rel_dir" != "." ]; then
+            chap="${rel_dir%%/*}"
+        fi
+
+        # Validate and prepare each chapter once, before linking its files.
+        if [ -n "$chap" ] && [ -z "${seen_chapter["$chap"]:-}" ]; then
+            seen_chapter["$chap"]=1
+            if [ -n "${CHAP_SKIP["$chap"]:-}" ]; then
+                continue
+            fi
+            if ! validate_chapter_files "$src/$chap" "$dst" "$chap"; then
+                CHAP_SKIP["$chap"]=1
+                continue
+            fi
+            # Replacement detection: if the destination's first file points at a
+            # different inode than the source's, this chapter was replaced with
+            # another scanlator's version. Wipe it so the new content is linked
+            # instead of the stale hardlinks (which would otherwise sit there
+            # until PURGE_ORPHANS noticed, one rescan later).
+            local rep_src rep_rel rep_dir rep_dst
+            rep_src=$(find "$src/$chap" -type f -print -quit 2>/dev/null)
+            if [ -n "$rep_src" ]; then
+                rep_rel="${rep_src#$src/}"
+                rep_dir=$(dirname "$rep_rel")
+                rep_dst="$dst"
+                if [ "$rep_dir" != "." ]; then
+                    rep_dst="$dst/$(map_rel_dir "$rep_dir")"
+                fi
+                rep_dst="$rep_dst/$(basename "$rep_src")"
+                if [ -e "$rep_dst" ]; then
+                    local src_inode dst_inode
+                    src_inode=$(stat -c %i "$rep_src" 2>/dev/null || echo 0)
+                    dst_inode=$(stat -c %i "$rep_dst" 2>/dev/null || echo 0)
+                    if [ "$src_inode" != "$dst_inode" ]; then
+                        log_info "  ↻ Replacing chapter: $chap"
+                        local wipe_path="${CHAP_DST["$chap"]:-}"
+                        if [ -n "$wipe_path" ] && [ "${wipe_path#/}" != "$wipe_path" ]; then
+                            rm -rf "$dst/$wipe_path"
+                        fi
+                    fi
+                fi
+            fi
+        fi
+        if [ -n "$chap" ] && [ -n "${CHAP_SKIP["$chap"]:-}" ]; then
+            continue
+        fi
+
         local sanitized_dir=""
         if [ "$rel_dir" != "." ]; then
-            sanitized_dir=$(sanitize_path "$rel_dir")
+            sanitized_dir=$(map_rel_dir "$rel_dir")
         fi
 
         local dst_file
@@ -279,11 +842,9 @@ sync_series() {
         log_warn "⚠️  Partial sync: $dst — linked=$linked failed=$failed (total=$total)"
     fi
 
-    # Update scan cache (mtime = now; next rescan uses this for fast-path check).
-    # We touch on every slow-path completion regardless of outcome — even "partial"
-    # syncs have progressed past the previous sync point, so the cache is correct.
+    # Update the scan cache, stamped with this scan's start time (see above).
     mkdir -p "$STAT_CACHE_DIR"
-    touch "$cache_file"
+    touch -d "@$scan_start" "$cache_file" 2>/dev/null || touch "$cache_file"
     return 0
 }
 

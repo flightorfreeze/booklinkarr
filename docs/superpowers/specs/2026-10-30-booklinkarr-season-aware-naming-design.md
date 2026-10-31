@@ -345,14 +345,11 @@ library size.
 - The chapter is **not linked**. No destination directory is created.
 - An **error** is logged naming the book, the chapter, and the offending file
   and reason, so it is visible in Dozzle.
-- The book's scan cache is **not updated**, so the next rescan re-validates
-  and re-reports the failure until the user re-downloads the chapter. The cost
-  is that one book keeps taking the slow path.
-
-  > Alternative: update the cache anyway and log the failure once. Cheaper, but
-  > the failure would not be re-reported and a re-download with a preserved
-  > old mtime would not be picked up.
-
+- The chapter continues to be **skipped on every subsequent scan** until its
+  source folder changes. The book's scan cache *is* updated, so the error is
+  logged **once**. A re-download produces a new mtime (and new inodes), which
+  invalidates the cache for that book and causes the chapter to be validated
+  and linked again.
 - Any pre-existing destination copy of that chapter is **left alone**. Because
   hardlinks share content, an already-linked copy of a corrupt chapter is
   corrupt too; the error log is the signal to re-download.
@@ -480,11 +477,8 @@ On a cold first scan that is one extra process per file in the library
 
 ## Open items
 
-- **Cache update on validation failure** — proposed: do **not** update the
-  book's scan cache when a chapter fails validation, so the failure re-reports
-  every rescan until the chapter is re-downloaded. The alternative (update the
-  cache, log once) is cheaper but a re-download with a preserved old mtime
-  would not be picked up.
 - **Deep archive validation** — `.cbz` / `.epub` files are only checked for the
   `PK` magic and non-zero size. A full CRC test (`unzip -t`) would catch a
   truncated archive but costs a full read of every archive on first link.
+  **Decided: not doing it** — the wear and time cost is not worth the gain.
+  Webtoons (images) are the problem case and are covered properly.
