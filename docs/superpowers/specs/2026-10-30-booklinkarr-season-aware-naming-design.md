@@ -44,15 +44,17 @@ dst directory" invariant, and it produced a delete/recreate loop with the
 1. Every chapter in a book gets a **globally unique, monotonically increasing**
    number, so Kavita reports unique numbers and Mihon sorts correctly.
 2. Season structure is preserved in the destination tree.
-3. The chapter **type word is taken from the source folder** and never
-   normalised — `Episode` stays `Episode`, `Chapter` stays `Chapter`,
-   `Spin-off` stays `Spin-off`.
+3. The chapter type word is normalised **per book**: if a series mixes
+   `Chapter` and `Episode`, the whole series uses whichever is more prevalent.
+   Other type words (`Volume`, `Blank`, `Spin-off`, …) keep their own identity.
 4. Decimal interstitials (`83.5`, `77.7`) keep their decimal value and their
    position between the surrounding chapters.
 5. Side stories land **after** the main story.
 6. Books with **no season markers are not renumbered at all** — no churn, no
    lost reading progress.
 7. Replacing a chapter with a better scanlator's version replaces it in place.
+8. A chapter whose files are corrupt or empty is **not linked at all** and
+   raises an error, so the gap is visible and the user knows to re-download.
 
 ## Non-goals
 
@@ -75,10 +77,10 @@ dst directory" invariant, and it produced a delete/recreate loop with the
 
 ## Design
 
-### 1. Two sanitizers, three responsibilities
+### 1. Three sanitizers
 
 The v0.7 split into `sanitize_book_name` / `sanitize_dir_name` was correct and
-stays. This spec adds a third function and changes one.
+stays. This spec adds a third function.
 
 ```
 sanitize_book_name(name)     # BOOK folder: strip digits (Kavita parser compat)
@@ -101,6 +103,20 @@ A chapter folder name is parsed into:
 | `number` | The numeric token associated with `type` | May be decimal (`83.5`). Absent if the name has no number. |
 | `residual` | The text left over after removing the type keyword and number | Used for canonical preference (§4). The scanlator/series prefix is part of this and cancels out when comparing two chapters. |
 | `is_side_story` | Type word is a side-story marker | See §4 |
+
+**Per-book type normalisation.** After parsing every chapter in a book, count
+how many use `Chapter` and how many use `Episode`. If both are present, the
+book's chapters all adopt the **more prevalent** one (counted by number of
+chapter folders). Other type words are unaffected.
+
+> Example: The Devil Butler has both `Episode N` (≈99 folders) and
+> `Chapter N` (≈450 folders). `Chapter` is more prevalent, so the `Episode`
+> folders become `Chapter N`. The numbers do not change — only the type word
+> — so this renames roughly 99 destination folders and resets reading progress
+> for those chapters in Kavita, once.
+>
+> If neither `Chapter` nor `Episode` appears in the book, no normalisation
+> happens.
 
 Anything in the name before the type keyword is the scanlator/series prefix
 and is discarded.
@@ -263,7 +279,89 @@ older mtime than the cache stamp, so the next scan sees "nothing newer" and
 `now`. A file that arrived mid-scan is then still newer than the cache and
 correctly triggers a cache miss.
 
-### 9. Behaviour that must not change
+### 9. New feature — corrupt / empty file detection
+
+### Problem
+
+Sometimes a chapter downloaded via Suwayomi arrives with some of its files
+corrupt or empty. In a file browser those files show no preview thumbnail;
+Kavita raises an error on the chapter; Mihon either stitches the good files
+together with a gap or repeats the last good file endlessly.
+
+Because the destination files are **hardlinks**, a corrupt source file is a
+corrupt destination file — the damage is shared, not copied.
+
+### Desired behaviour
+
+Detect the corruption and **do not link that chapter at all**, raising a loud
+error, so the chapter is visibly missing from the library and the user knows
+to re-download it. The check is **all-or-nothing per chapter**: one bad file
+means the whole chapter is withheld.
+
+### Detection
+
+Two checks, applied to a chapter's files when that chapter is about to be
+linked:
+
+**1. Zero-byte check.** Any file of size 0 fails. This is the "empty file"
+case.
+
+**2. Format sanity check.** The first bytes of the file must match the
+magic signature of its extension, and — for WebP — the RIFF size field must
+agree with the actual file size (this is what catches a truncated download):
+
+| Extension | Check |
+|---|---|
+| `.webp` | bytes 0-3 = `RIFF`, bytes 8-11 = `WEBP`, and `riff_size + 8 == file_size` |
+| `.avif` | bytes 4-7 = `ftyp` |
+| `.jpg` / `.jpeg` | bytes 0-1 = `FF D8` |
+| `.png` | bytes 0-7 = `89 50 4E 47 0D 0A 1A 0A` |
+| `.gif` | bytes 0-2 = `GIF` |
+| `.pdf` | bytes 0-3 = `%PDF` |
+| `.cbz` / `.cbr` / `.zip` / `.epub` | bytes 0-1 = `PK` |
+| anything else | zero-byte check only |
+
+A full decode is deliberately **not** attempted — that would need an image
+library in the image and would be far too slow. The RIFF size check catches
+truncation, which is the dominant real-world failure; the magic-byte check
+catches garbage files.
+
+### Implementation
+
+The header of a file is read with a single `od -An -tx1 -N12` call, producing
+a hex string that is compared with bash string slicing and one arithmetic
+expansion for the RIFF size. That is **one process per file**.
+
+### When it runs
+
+Only when a chapter is being linked — i.e. on the slow path, and only for
+chapters whose files are not already present at the destination. Already-synced
+chapters are skipped by the existing per-file existence check and are never
+re-validated. This keeps the cost proportional to *new* content rather than to
+library size.
+
+### Behaviour on failure
+
+- The chapter is **not linked**. No destination directory is created.
+- An **error** is logged naming the book, the chapter, and the offending file
+  and reason, so it is visible in Dozzle.
+- The book's scan cache is **not updated**, so the next rescan re-validates
+  and re-reports the failure until the user re-downloads the chapter. The cost
+  is that one book keeps taking the slow path.
+
+  > Alternative: update the cache anyway and log the failure once. Cheaper, but
+  > the failure would not be re-reported and a re-download with a preserved
+  > old mtime would not be picked up.
+
+- Any pre-existing destination copy of that chapter is **left alone**. Because
+  hardlinks share content, an already-linked copy of a corrupt chapter is
+  corrupt too; the error log is the signal to re-download.
+
+### Configuration
+
+`VALIDATE_FILES` — `1` (default) enables the checks, `0` disables them.
+
+## 10. Behaviour that must not change
 
 - Book folder names still have digits stripped (`sanitize_book_name`).
 - File names are not touched (extensions and numeric ordering preserved).
@@ -281,27 +379,40 @@ work the script already does (Jungle Juice has ~10,000 files).
 
 | Phase | Impact |
 |---|---|
-| Initial scan | + pre-pass per book (negligible). Chapters whose destination path changes are re-linked — 226 new hardlinks for Jungle Juice, one time. |
+| Initial scan | + pre-pass per book (negligible). Chapters whose destination path changes are re-linked — 226 new hardlinks for Jungle Juice, one time. **Plus** one `od` call per file for the corrupt-file check (§9). |
 | Inode cache build | Unchanged. |
 | Inode cache rebuild | Unchanged. |
-| Rescan (warm cache) | Unchanged. The pre-pass only runs on a cache **miss**. |
-| Inotify trigger | Unchanged latency — the pre-pass is inside the existing sync. |
+| Rescan (warm cache) | Unchanged. The pre-pass and the validation both only run on a cache **miss**. |
+| Inotify trigger | Unchanged latency — the pre-pass and the validation are inside the existing sync. |
 
 The pre-pass must run on every slow-path sync (a new chapter changes the
 numbering of everything after it), but it is bounded by chapter count, not
 file count.
 
+The corrupt-file validation is bounded by **newly linked** content: one `od`
+call per file that is about to be linked, and zero for files already present.
+On a cold first scan that is one extra process per file in the library
+(~10k files for Jungle Juice); on every subsequent scan it is near zero.
+
 ## Migration
 
 1. Deploy the new image.
-2. The first scan creates the new `Season N/` tree and removes the legacy flat
-   `Episode N SN` folders (§6).
-3. Kavita needs a library re-scan to pick up the new structure. The old
+2. **Delete the Jungle Juice destination book folder** (not the source — the
+   source stays exactly as Suwayomi wrote it):
+   ```bash
+   rm -rf "/home/carter117chief/media-drive/data/media/books/webtoons/Jungle Juice"
+   ```
+   This removes the legacy flat `Episode N SN` layout in one step. The
+   booklinkarr self-cleanup in §6 is the general safety net for future
+   renames, but it is not needed for this one-time migration.
+3. The next scan recreates the destination as `Season 1/` … `Season 3/` plus
+   the side stories.
+4. Kavita needs a library re-scan to pick up the new structure. The old
    chapters are removed and new ones created — **reading progress on Jungle
    Juice's chapters will reset**, since Kavita keys progress by chapter id.
    This is a one-time cost for this series; no other book on disk has season
    markers, so no other book is affected.
-4. The diagnostic scripts used during this investigation are removed from the
+5. The diagnostic scripts used during this investigation are removed from the
    VM (`/home/carter117chief/docker/scripts/diagnose-*.sh`).
 
 ## Testing
@@ -321,6 +432,20 @@ file count.
 | `Atsumaru (EN)_Black Butler_87` (no seasons) | `87` — bare number, prefix stripped, not a side story |
 | `Atsumaru (EN)_Black Butler_87` (book has seasons) | appended with the loose chapters, type word preserved |
 | `Atsumaru (EN)_X_Alpha_Episode 1 S2` in a book whose only season is S1 | flat `Episode 1` — no `Season` wrapper for single-season books |
+| book with 99 `Episode N` and 450 `Chapter N` folders | all become `Chapter N` — per-book type normalisation |
+| book with only `Episode N` folders | unchanged — `Episode N` |
+
+### Corrupt-file validation (§9)
+
+| Case | Expected |
+|---|---|
+| chapter with one 0-byte `.webp` | chapter not linked; error logged naming the file |
+| chapter with a truncated `.webp` (RIFF size > actual size) | chapter not linked; error logged |
+| chapter with a `.webp` whose first 4 bytes are not `RIFF` | chapter not linked; error logged |
+| chapter with a valid `.webp` whose RIFF size matches | linked normally |
+| chapter with a valid `.cbz` (PK magic) | linked normally |
+| chapter with a 0-byte `.epub` | chapter not linked; error logged |
+| `VALIDATE_FILES=0` | no checks performed; corrupt chapters linked as before |
 
 ### Integration (on VM444, after deploy)
 
@@ -339,13 +464,27 @@ file count.
 8. Replace a chapter with a different scanlator's folder → the destination
    contains the new scanlator's files after one cycle.
 
+## Resolved decisions
+
+- **Legacy cleanup mechanism** — booklinkarr self-cleans (§6). The one-time
+  Jungle Juice migration is done by deleting the destination book folder.
+- **Tie-break for equal mtimes** — scanlator name descending, then folder name
+  descending.
+- **Numbering regime** — contiguous global renumbering for books with season
+  markers; source numbers preserved otherwise.
+- **Season wrapper** — only for books with 2+ distinct seasons; named
+  `Season <n>`.
+- **Side stories** — appended at the end of the book, no separate folder.
+- **Type word** — normalised per book to the more prevalent of Chapter /
+  Episode; other type words keep their identity.
+
 ## Open items
 
-- **Legacy cleanup mechanism** — §6 describes booklinkarr removing the legacy
-  path. If that proves risky in testing, the fallback is a one-time manual
-  command:
-  ```bash
-  find "/home/carter117chief/media-drive/data/media/books/webtoons/Jungle Juice" \
-       -maxdepth 1 -type d -name "Episode * S[0-9]*" -exec rm -rf {} +
-  ```
-- **Tie-break order for equal mtimes** — proposed: scanlator name descending.
+- **Cache update on validation failure** — proposed: do **not** update the
+  book's scan cache when a chapter fails validation, so the failure re-reports
+  every rescan until the chapter is re-downloaded. The alternative (update the
+  cache, log once) is cheaper but a re-download with a preserved old mtime
+  would not be picked up.
+- **Deep archive validation** — `.cbz` / `.epub` files are only checked for the
+  `PK` magic and non-zero size. A full CRC test (`unzip -t`) would catch a
+  truncated archive but costs a full read of every archive on first link.
