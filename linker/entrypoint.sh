@@ -155,8 +155,30 @@ CH_NUM=""
 CH_SEASON=""
 CH_FRAC=""
 CH_RESIDUAL=""
+CH_SUFFIX=""
 CH_SIDESTORY=0
 CH_WORDS=0
+
+# Parse the tail of a chapter name (everything after the type + number) for a
+# season marker and a chapter title. The season may sit at the end of the tail
+# or in front of the title:
+#   " S2"         -> season 2, title ""
+#   "_S1"         -> season 1, title ""
+#   "_S1_Tragedy" -> season 1, title "_Tragedy"
+#   "_Tragedy"    -> no season, title "_Tragedy"
+parse_chapter_tail() {
+    local tail="$1"
+    CH_SEASON=""
+    CH_SUFFIX="$tail"
+    if [[ "$tail" =~ (^|[_[:space:]])(Season|Se|S)([[:space:]_.]*)([0-9]+)([_[:space:]]|$) ]]; then
+        local m="${BASH_REMATCH[0]}"
+        local trail="${BASH_REMATCH[5]}"
+        local pre="${tail%%"$m"*}"
+        local post="${tail#*"$m"}"
+        CH_SEASON="${BASH_REMATCH[4]}"
+        CH_SUFFIX="$pre$trail$post"
+    fi
+}
 
 # Parse a chapter folder name into the globals above.
 parse_chapter_name() {
@@ -168,17 +190,9 @@ parse_chapter_name() {
     CH_SEASON=""
     CH_FRAC=""
     CH_RESIDUAL="$name"
+    CH_SUFFIX=""
     CH_SIDESTORY=0
     CH_WORDS=0
-
-    # --- season marker (must be a trailing token) ---
-    if [[ "$work" =~ ^(.*)[[:space:]_]+Season[[:space:]_.]*([0-9]+)$ ]]; then
-        CH_SEASON="${BASH_REMATCH[2]}"
-        work="${BASH_REMATCH[1]}"
-    elif [[ "$work" =~ ^(.*)[[:space:]_]+S[[:space:]_.]*([0-9]+)$ ]]; then
-        CH_SEASON="${BASH_REMATCH[2]}"
-        work="${BASH_REMATCH[1]}"
-    fi
 
     # --- type keyword plus the number that follows it ---
     local i kw after before sep int frac rem off
@@ -204,7 +218,14 @@ parse_chapter_name() {
                 CH_FRAC="${frac#*.}"
             fi
             CH_SIDESTORY="${CH_SIDE[$i]}"
-            CH_RESIDUAL="$before$rem"
+            # CH_RESIDUAL is the text BEFORE the type keyword. It is used to
+            # tell a canonical chapter apart from a side story that carries
+            # extra words ("Vanessa's story Chapter 1" vs "Chapter 1").
+            # Everything after the number is the chapter TITLE and season, and
+            # is handled by parse_chapter_tail so that it survives into the
+            # destination name ("Chapter 1_Tragedy" stays "Chapter 1_Tragedy").
+            CH_RESIDUAL="$before"
+            parse_chapter_tail "$rem"
             CH_WORDS=$(printf '%s' "$CH_RESIDUAL" | wc -w)
             return 0
         fi
@@ -243,7 +264,7 @@ build_chapter_map() {
     CHAP_DST=()
     CHAP_SKIP=()
 
-    local -a nm=() ty=() num=() sea=() frc=() sid=() wrd=() mtm=()
+    local -a nm=() ty=() num=() sea=() frc=() sid=() wrd=() mtm=() sfx=()
     local n=0 dir name i
 
     while IFS= read -r dir; do
@@ -256,6 +277,7 @@ build_chapter_map() {
         frc[$n]="$CH_FRAC"
         sid[$n]="$CH_SIDESTORY"
         wrd[$n]="$CH_WORDS"
+        sfx[$n]="$CH_SUFFIX"
         mtm[$n]=$(stat -c %Y "$dir" 2>/dev/null || echo 0)
         n=$((n + 1))
     done < <(find "$src" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
@@ -415,12 +437,14 @@ build_chapter_map() {
         # The winner takes the destination; the others are either superseded
         # (same chapter from another scanlator) or demoted to a side story
         # (a different chapter that carried the same number).
+        # The chapter title (e.g. "_Tragedy") is carried over from the source.
         local wtype="${ty[$winner]}"
+        local wsuf="${sfx[$winner]}"
         local dpath=""
         if [ -n "$wtype" ]; then
-            dpath="$wtype $assigned"
+            dpath="$wtype $assigned$wsuf"
         else
-            dpath="$assigned"
+            dpath="$assigned$wsuf"
         fi
         if [ "$nested" -eq 1 ] && [ "${dsea[$winner]}" != "0" ]; then
             dpath="Season ${dsea[$winner]}/$dpath"
@@ -468,9 +492,9 @@ build_chapter_map() {
             local st="${ty[$i]}"
             local sp="$counter"
             if [ -n "$st" ]; then
-                dest[$i]="$st $sp"
+                dest[$i]="$st $sp${sfx[$i]}"
             else
-                dest[$i]="$sp"
+                dest[$i]="$sp${sfx[$i]}"
             fi
             skip[$i]=0
         done
@@ -482,9 +506,9 @@ build_chapter_map() {
             local st="${ty[$i]}"
             local sp="$max_assigned"
             if [ -n "$st" ]; then
-                dest[$i]="$st $sp"
+                dest[$i]="$st $sp${sfx[$i]}"
             else
-                dest[$i]="$sp"
+                dest[$i]="$sp${sfx[$i]}"
             fi
             skip[$i]=0
         done
@@ -502,6 +526,53 @@ build_chapter_map() {
         CHAP_DST["${nm[$i]}"]="$d"
     done
     return 0
+}
+
+# Remove destination folders that the current naming scheme replaces.
+#
+# When the naming scheme changes (e.g. a series mixes "Episode N" and
+# "Chapter N" and gets normalised to one of them), the old folder would be
+# left behind: its inodes still exist in the source, so PURGE_ORPHANS does
+# not consider them orphans, and Kavita would show the chapter twice.
+#
+# For each chapter we compute the LEGACY destination name (what the previous
+# sanitize_dir_name produced) and, if it differs from the new name, remove it.
+# Safety: a legacy path is only removed when no chapter uses it under the new
+# scheme, and only when every file in it is a hardlink (link count >= 2) —
+# a file unique to the destination means something else put it there.
+cleanup_legacy_paths() {
+    local src="$1" dst="$2"
+    local dir name legacy newpath old ff nlink unsafe
+    local -A used=()
+    local k
+
+    for k in "${!CHAP_DST[@]}"; do
+        used["${CHAP_DST["$k"]}"]=1
+    done
+
+    while IFS= read -r dir; do
+        name=$(basename "$dir")
+        newpath="${CHAP_DST["$name"]:-}"
+        [ -z "$newpath" ] && continue          # superseded chapter, nothing to clean
+        legacy="$(sanitize_dir_name "$name")"
+        [ "$legacy" = "$newpath" ] && continue  # naming unchanged for this chapter
+        [ -n "${used["$legacy"]:-}" ] && continue  # another chapter uses that path
+        old="$dst/$legacy"
+        [ -d "$old" ] || continue
+
+        unsafe=0
+        while IFS= read -r -d '' ff; do
+            nlink=$(stat -c %h "$ff" 2>/dev/null || echo 1)
+            if [ "$nlink" -lt 2 ]; then
+                unsafe=1
+                break
+            fi
+        done < <(find "$old" -type f -print0 2>/dev/null)
+        [ "$unsafe" -eq 1 ] && continue
+
+        log_info "  ↻ Removing replaced folder: $legacy"
+        rm -rf -- "$old"
+    done < <(find "$src" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
 }
 
 # Map a source-relative directory path to its destination-relative path.
@@ -728,6 +799,9 @@ sync_series() {
     # Build the per-book chapter map: decides each chapter's destination path,
     # handles season renumbering, side stories and chapter replacement.
     build_chapter_map "$src"
+
+    # Remove destination folders that the current naming scheme replaces.
+    cleanup_legacy_paths "$src" "$dst"
 
     mapfile -t src_files < <(find "$src" -type f 2>/dev/null)
 

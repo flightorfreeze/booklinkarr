@@ -43,6 +43,17 @@ source "$TMPD/lib.sh" || { echo "  Could not source extracted functions"; exit 1
 echo "  CHAP_DST: $(declare -p CHAP_DST 2>&1 | head -c 120)"
 echo ""
 
+SRC_ROOT="/home/carter117chief/media-drive/data/book-downloads"
+DST_ROOT="/home/carter117chief/media-drive/data/media/books"
+TYPES="mangas comics web-novels light-novels webtoons"
+all_book_dirs() {
+    local t
+    for t in $TYPES; do
+        [ -d "$SRC_ROOT/$t" ] || continue
+        find "$SRC_ROOT/$t" -mindepth 2 -maxdepth 2 -type d 2>/dev/null
+    done
+}
+
 echo "================================================================"
 echo "3. FIXTURE RUN"
 echo "================================================================"
@@ -66,7 +77,6 @@ parse_chapter_name "Atsumaru (EN)_Series_Alpha_Episode 12 S2"
 echo "    CH_TYPE=[$CH_TYPE] CH_NUM=[$CH_NUM] CH_SEASON=[$CH_SEASON] CH_FRAC=[$CH_FRAC] CH_SIDE=[$CH_SIDESTORY]"
 echo ""
 
-# Run in the CURRENT shell so the map survives for inspection.
 build_chapter_map "$FIX/book" 2>/dev/null
 echo "  build_chapter_map exit: $?"
 echo ""
@@ -127,16 +137,54 @@ fi
 echo ""
 
 echo "================================================================"
+echo "3b. CHAPTER TITLE PRESERVATION"
+echo "================================================================"
+FIX2="$TMPD/fix2"
+mkdir -p "$FIX2/book"
+mkdir -p "$FIX2/book/Atsumaru (EN)_Series_Alpha_Chapter 1_Tragedy"
+mkdir -p "$FIX2/book/Atsumaru (EN)_Series_Alpha_Chapter 2_Oddity"
+build_chapter_map "$FIX2/book" 2>/dev/null
+tcheck() {
+    local src="$1" want="$2"
+    local got="${CHAP_DST["$src"]:-<MISSING>}"
+    if [ "$got" = "$want" ]; then
+        echo "    OK   $got"
+    else
+        echo "    FAIL got '$got', want '$want'"
+        fail=1
+    fi
+}
+tcheck "Atsumaru (EN)_Series_Alpha_Chapter 1_Tragedy" "Chapter 1_Tragedy"
+tcheck "Atsumaru (EN)_Series_Alpha_Chapter 2_Oddity"  "Chapter 2_Oddity"
+
+FIX3="$TMPD/fix3"
+mkdir -p "$FIX3/book"
+mkdir -p "$FIX3/book/Atsumaru (EN)_Series_Alpha_Episode 1_Tragedy S1"
+mkdir -p "$FIX3/book/Atsumaru (EN)_Series_Alpha_Episode 2_Oddity S1"
+mkdir -p "$FIX3/book/Atsumaru (EN)_Series_Alpha_Episode 1_Extra S2"
+build_chapter_map "$FIX3/book" 2>/dev/null
+tcheck "Atsumaru (EN)_Series_Alpha_Episode 1_Tragedy S1" "Season 1/Episode 1_Tragedy"
+tcheck "Atsumaru (EN)_Series_Alpha_Episode 2_Oddity S1"  "Season 1/Episode 2_Oddity"
+tcheck "Atsumaru (EN)_Series_Alpha_Episode 1_Extra S2"    "Season 2/Episode 3_Extra"
+
+FIX4="$TMPD/fix4"
+mkdir -p "$FIX4/book"
+mkdir -p "$FIX4/book/Atsumaru (EN)_Series_Alpha_Episode 1_S1_Tragedy"
+mkdir -p "$FIX4/book/Atsumaru (EN)_Series_Alpha_Episode 2_S1_Oddity"
+mkdir -p "$FIX4/book/Atsumaru (EN)_Series_Alpha_Episode 1_S2_Extra"
+build_chapter_map "$FIX4/book" 2>/dev/null
+tcheck "Atsumaru (EN)_Series_Alpha_Episode 1_S1_Tragedy" "Season 1/Episode 1_Tragedy"
+tcheck "Atsumaru (EN)_Series_Alpha_Episode 2_S1_Oddity"  "Season 1/Episode 2_Oddity"
+tcheck "Atsumaru (EN)_Series_Alpha_Episode 1_S2_Extra"    "Season 2/Episode 3_Extra"
+echo ""
+
+echo "================================================================"
 echo "4. VALIDATOR TEST (valid / truncated / empty / wrong-magic)"
 echo "================================================================"
 VD="$TMPD/valid"; VD2="$TMPD/truncated"; VD3="$TMPD/empty"; VD4="$TMPD/wrongmagic"
 mkdir -p "$VD" "$VD2" "$VD3" "$VD4"
-# A RIFF/WEBP file: 'RIFF' + size(4, LITTLE endian) + 'WEBP' + payload.
-# size must equal filesize-8. Using 258 (0x00000102 -> bytes 02 01 00 00)
-# so a big-endian read would give a wildly different number.
 printf 'RIFF\x02\x01\x00\x00WEBP' > "$VD/good.webp"
-head -c 254 /dev/zero >> "$VD/good.webp"        # total 266 = 258 + 8  ✓
-# Same header but only 100 bytes of payload -> declared 266, actual 112 -> truncated.
+head -c 254 /dev/zero >> "$VD/good.webp"
 printf 'RIFF\x02\x01\x00\x00WEBP' > "$VD2/short.webp"
 head -c 100 /dev/zero >> "$VD2/short.webp"
 : > "$VD3/empty.webp"
@@ -161,17 +209,68 @@ vcheck "$VD4" FAIL "wrong magic bytes"
 echo ""
 
 echo "================================================================"
-echo "5. REAL LIBRARY CHECK"
+echo "4b. LEGACY FOLDER CLEANUP"
 echo "================================================================"
-SRC_ROOT="/home/carter117chief/media-drive/data/book-downloads"
-TYPES="mangas comics web-novels light-novels webtoons"
-all_book_dirs() {
-    local t
-    for t in $TYPES; do
-        [ -d "$SRC_ROOT/$t" ] || continue
-        find "$SRC_ROOT/$t" -mindepth 2 -maxdepth 2 -type d 2>/dev/null
-    done
-}
+lfail=0
+CL="$TMPD/cleanup"
+mkdir -p "$CL/src/Book_Alpha_Episode 5" "$CL/src/Book_Alpha_Episode 9"
+mkdir -p "$CL/dst/Episode 5" "$CL/dst/Episode 9"
+echo hi > "$CL/src/Book_Alpha_Episode 5/001.webp"
+ln "$CL/src/Book_Alpha_Episode 5/001.webp" "$CL/dst/Episode 5/001.webp"
+echo unique > "$CL/dst/Episode 9/manual.txt"
+
+CHAP_DST=()
+CHAP_DST["Book_Alpha_Episode 5"]="Chapter 5"
+CHAP_DST["Book_Alpha_Episode 9"]="Chapter 9"
+cleanup_legacy_paths "$CL/src" "$CL/dst" >/dev/null 2>&1
+
+if [ -d "$CL/dst/Episode 5" ]; then
+    echo "    FAIL legacy folder with only hardlinks was NOT removed"
+    lfail=1
+else
+    echo "    OK   legacy folder with only hardlinks removed"
+fi
+if [ -d "$CL/dst/Episode 9" ]; then
+    echo "    OK   legacy folder with a unique file kept"
+else
+    echo "    FAIL legacy folder with a unique file was removed"
+    lfail=1
+fi
+echo ""
+
+echo "================================================================"
+echo "5. WHAT WOULD CHANGE ON DEPLOY (per book)"
+echo "================================================================"
+if [ -d "$SRC_ROOT" ] && [ -d "$DST_ROOT" ]; then
+    printf '  %-34s %8s %8s\n' "book" "new" "orphan"
+    printf '  %-34s %8s %8s\n' "----------------------------------" "--------" "--------"
+    while IFS= read -r bd; do
+        rel="${bd#$SRC_ROOT/}"
+        t="${rel%%/*}"
+        bn=$(basename "$bd")
+        db="$DST_ROOT/$t/$(sanitize_book_name "$bn")"
+        [ -d "$db" ] || continue
+        build_chapter_map "$bd" 2>/dev/null
+        for k in "${!CHAP_DST[@]}"; do echo "${CHAP_DST["$k"]}"; done | sort > "$TMPD/c"
+        find "$db" -mindepth 1 -maxdepth 2 -type d 2>/dev/null \
+            | sed "s|^$db/||" | grep -vE '^Season [0-9]+$' | sort > "$TMPD/e"
+        newc=$(comm -23 "$TMPD/c" "$TMPD/e" | wc -l)
+        gone=$(comm -13 "$TMPD/c" "$TMPD/e" | wc -l)
+        if [ "$newc" -gt 0 ] || [ "$gone" -gt 0 ]; then
+            printf '  %-34s %8s %8s\n' "$bn" "$newc" "$gone"
+        fi
+    done < <(all_book_dirs)
+    echo ""
+    echo "  'new'    = chapter folders that would be created"
+    echo "  'orphan' = existing folders the new naming replaces (now auto-removed)"
+else
+    echo "  library not found — skipped"
+fi
+echo ""
+
+echo "================================================================"
+echo "6. REAL LIBRARY CHECK"
+echo "================================================================"
 if [ -d "$SRC_ROOT" ]; then
     dupbooks=0; checked=0
     while IFS= read -r bd; do
@@ -206,3 +305,4 @@ echo "SUMMARY"
 echo "================================================================"
 [ "$fail" = "0" ] && echo "  naming logic: OK" || echo "  naming logic: FAILED"
 [ "$vfail" = "0" ] && echo "  validator:    OK" || echo "  validator:    FAILED"
+[ "$lfail" = "0" ] && echo "  cleanup:      OK" || echo "  cleanup:      FAILED"
