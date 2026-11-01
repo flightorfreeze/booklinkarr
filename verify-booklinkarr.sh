@@ -20,9 +20,15 @@ trap 'rm -rf "$TMPD"' EXIT
 echo "================================================================"
 echo "2. EXTRACT THE DEFINITIONS REGION"
 echo "================================================================"
+# Three ranges, skipping the "=== Validation ===" block (it would exit the
+# verifier) and the main flow:
+#   config + sanitizers + chapter map + validator + logging helpers
+#   file operations + sync_series + scan_type + log dedup
 awk '
-    /^# === Path sanitization/ { f = 1 }
+    /^# === Configuration ===/ { f = 1 }
     /^# === Validation ===/      { f = 0 }
+    /^# === File operations ===/ { f = 1 }
+    /^# === Scan all types/      { f = 0 }
     f { print }
 ' "$SRC" > "$TMPD/lib.sh"
 echo "  extracted lines: $(wc -l < "$TMPD/lib.sh")"
@@ -37,6 +43,9 @@ echo ""
 log_info()  { echo "    INFO: $*"; }
 log_warn()  { echo "    WARN: $*"; }
 log_error() { echo "    ERROR: $*" >&2; }
+
+# Point the cache dirs at the temp dir so the verifier never writes to /var/lib.
+export CACHE_DIR="$TMPD/cache"
 
 # shellcheck disable=SC1090
 source "$TMPD/lib.sh" || { echo "  Could not source extracted functions"; exit 1; }
@@ -53,6 +62,33 @@ all_book_dirs() {
         find "$SRC_ROOT/$t" -mindepth 2 -maxdepth 2 -type d 2>/dev/null
     done
 }
+
+echo "================================================================"
+echo "2b. LITERAL PREFIX STRIPPING (glob-special directory names)"
+echo "================================================================"
+# A directory name containing [ ] * ? must be matched LITERALLY when
+# stripping the book-dir prefix. Otherwise the prefix match fails, the whole
+# absolute path survives, and the chapter name ends up empty
+# ("bad array subscript").
+pfail=0
+pcheck() {
+    local base="$1" expect="$2" got
+    local src="/data/book-downloads/light-novels/Site/$base"
+    local f="$src/Some Chapter/v01.epub"
+    got="${f#"$src"/}"
+    if [ "$got" = "$expect" ]; then
+        echo "    OK   $base"
+    else
+        echo "    FAIL $base -> got '$got', want '$expect'"
+        pfail=1
+    fi
+}
+pcheck "Naruto Novels [VIZ Media] [LuCaZ]" "Some Chapter/v01.epub"
+pcheck "Plain Book Name"                     "Some Chapter/v01.epub"
+pcheck "Book (2024) [Digital]"               "Some Chapter/v01.epub"
+pcheck "Starship*Odyssey"                     "Some Chapter/v01.epub"
+pcheck "Question?Mark"                        "Some Chapter/v01.epub"
+echo ""
 
 echo "================================================================"
 echo "3. FIXTURE RUN"
@@ -239,6 +275,43 @@ fi
 echo ""
 
 echo "================================================================"
+echo "4c. VALIDATION 'LOG ONCE' BEHAVIOUR"
+echo "================================================================"
+# A corrupt chapter must be reported once, then skipped silently on later
+# scans until its source changes.
+CF="$TMPD/corruptbook"
+mkdir -p "$CF/src/Book_Alpha_Chapter 1"
+printf 'NOTAWEBPFILE' > "$CF/src/Book_Alpha_Chapter 1/001.webp"
+out1=$(sync_series "$CF/src/Book_Alpha_Chapter 1" "$CF/dst" 2>&1)
+out2=$(sync_series "$CF/src/Book_Alpha_Chapter 1" "$CF/dst" 2>&1)
+c1=$(printf '%s' "$out1" | grep -c "Corrupt chapter")
+c2=$(printf '%s' "$out2" | grep -c "Corrupt chapter")
+if [ "$c1" -eq 1 ] && [ "$c2" -eq 0 ]; then
+    echo "    OK   reported once, then skipped silently"
+else
+    echo "    FAIL first call reported $c1, second reported $c2 (expected 1 then 0)"
+    lfail=1
+fi
+# The chapter must not have been linked.
+if [ -d "$CF/dst/Chapter 1" ]; then
+    echo "    FAIL corrupt chapter was linked to the destination"
+    lfail=1
+else
+    echo "    OK   corrupt chapter was not linked"
+fi
+# Touching the source must make it report again.
+printf 'ALSO NOT A WEBP' > "$CF/src/Book_Alpha_Chapter 1/002.webp"
+out3=$(sync_series "$CF/src/Book_Alpha_Chapter 1" "$CF/dst" 2>&1)
+c3=$(printf '%s' "$out3" | grep -c "Corrupt chapter")
+if [ "$c3" -eq 1 ]; then
+    echo "    OK   reports again after the source changes"
+else
+    echo "    FAIL reports $c3 times after the source changed (expected 1)"
+    lfail=1
+fi
+echo ""
+
+echo "================================================================"
 echo "5. WHAT WOULD CHANGE ON DEPLOY (per book)"
 echo "================================================================"
 if [ -d "$SRC_ROOT" ] && [ -d "$DST_ROOT" ]; then
@@ -306,3 +379,4 @@ echo "================================================================"
 [ "$fail" = "0" ] && echo "  naming logic: OK" || echo "  naming logic: FAILED"
 [ "$vfail" = "0" ] && echo "  validator:    OK" || echo "  validator:    FAILED"
 [ "$lfail" = "0" ] && echo "  cleanup:      OK" || echo "  cleanup:      FAILED"
+[ "$pfail" = "0" ] && echo "  prefix strip: OK" || echo "  prefix strip: FAILED"

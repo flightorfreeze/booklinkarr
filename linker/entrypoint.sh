@@ -62,6 +62,10 @@ STAT_CACHE_MAX_AGE="${STAT_CACHE_MAX_AGE:-604800}"  # 7 days, safety net
 # Checks run only for chapters that are about to be linked.
 VALIDATE_FILES="${VALIDATE_FILES:-1}"
 
+# Marker files for chapters that failed validation, so the error is reported
+# once rather than on every rescan.
+FAILED_DIR="${CACHE_DIR:-/var/lib/booklinkarr}/failed"
+
 # === Path sanitization (Kavita parser compat + chapter rename) ===
 # Two separate functions because book names and chapter names want different
 # transforms:
@@ -547,7 +551,8 @@ cleanup_legacy_paths() {
     local k
 
     for k in "${!CHAP_DST[@]}"; do
-        used["${CHAP_DST["$k"]}"]=1
+        local u="${CHAP_DST["$k"]}"
+        [ -n "$u" ] && used["$u"]=1
     done
 
     while IFS= read -r dir; do
@@ -555,6 +560,7 @@ cleanup_legacy_paths() {
         newpath="${CHAP_DST["$name"]:-}"
         [ -z "$newpath" ] && continue          # superseded chapter, nothing to clean
         legacy="$(sanitize_dir_name "$name")"
+        [ -z "$legacy" ] && continue
         [ "$legacy" = "$newpath" ] && continue  # naming unchanged for this chapter
         [ -n "${used["$legacy"]:-}" ] && continue  # another chapter uses that path
         old="$dst/$legacy"
@@ -580,8 +586,15 @@ cleanup_legacy_paths() {
 # deeper components are sanitized individually.
 map_rel_dir() {
     local rel_dir="$1"
+    if [ -z "$rel_dir" ]; then
+        echo ""
+        return
+    fi
     local first="${rel_dir%%/*}"
-    local mapped="${CHAP_DST["$first"]:-}"
+    local mapped=""
+    if [ -n "$first" ]; then
+        mapped="${CHAP_DST["$first"]:-}"
+    fi
     if [ -z "$mapped" ]; then
         mapped="$(sanitize_dir_name "$first")"
     fi
@@ -592,21 +605,38 @@ map_rel_dir() {
     fi
 }
 
+# Newest mtime (epoch seconds) among the files under a directory.
+newest_mtime() {
+    find "$1" -type f -printf '%T@\n' 2>/dev/null \
+        | awk 'BEGIN { m = 0 } { if ($1 + 0 > m) m = $1 + 0 } END { printf "%d", m }'
+}
+
+# Marker file recording that a chapter failed validation, holding the newest
+# source mtime at the time it failed. Used so the error is reported ONCE: a
+# chapter that is still broken and has not changed since is skipped silently
+# on later scans until the user re-downloads it.
+failed_flag_path() {
+    printf '%s/%s.flag' "$FAILED_DIR" "$(printf '%s' "$1" | tr '/ ' '__')"
+}
+
 # === Corrupt / empty file detection ===
 # Returns 0 when every file in the chapter looks sound, 1 otherwise.
+# Reports ONE line per chapter (plus up to three example filenames) rather
+# than a line per bad file — a broken chapter can have 80+ bad files and the
+# per-file spam buries the rest of the log.
 validate_chapter_files() {
-    local dir="$1" book="$2" name="$3"
+    local dir="$1" book="$2" chapter="$3"
 
     [ "${VALIDATE_FILES:-1}" -eq 1 ] || return 0
     [ -d "$dir" ] || return 0
 
-    local f size hex riff bad_count=0
+    local f size hex riff bad_count=0 unreadable=0
     local -a bad=()
 
     while IFS= read -r -d '' f; do
         size=$(stat -c %s "$f" 2>/dev/null || echo 0)
         if [ "$size" -eq 0 ]; then
-            bad+=("empty file ($f)")
+            bad+=("$f")
             bad_count=$((bad_count + 1))
             continue
         fi
@@ -617,8 +647,16 @@ validate_chapter_files() {
                 #   bytes 4-7  size    -> hex 8-15
                 #   bytes 8-11 "WEBP"  -> hex 16-23
                 hex=$(od -An -tx1 -N12 "$f" 2>/dev/null | tr -d ' \n' || echo "")
-                if [ "${hex:0:8}" != "52494646" ] || [ "${hex:16:8}" != "57454250" ]; then
-                    bad+=("not a WebP file ($f)")
+                if [ -z "$hex" ]; then
+                    # The file could not be READ at all (I/O error, stale NFS
+                    # handle, dead disk). That is a storage problem, not a
+                    # bad download — say so, because the fix is completely
+                    # different from "re-download this chapter".
+                    bad+=("$f")
+                    bad_count=$((bad_count + 1))
+                    unreadable=$((unreadable + 1))
+                elif [ "${hex:0:8}" != "52494646" ] || [ "${hex:16:8}" != "57454250" ]; then
+                    bad+=("$f")
                     bad_count=$((bad_count + 1))
                 else
                     # The RIFF size field is LITTLE-endian, so the four bytes
@@ -629,7 +667,7 @@ validate_chapter_files() {
                         riff=$((16#${hex:14:2}${hex:12:2}${hex:10:2}${hex:8:2})) 2>/dev/null || riff=0
                     fi
                     if [ $((riff + 8)) -ne "$size" ]; then
-                        bad+=("truncated WebP, declares $((riff + 8)) bytes but is $size ($f)")
+                        bad+=("$f")
                         bad_count=$((bad_count + 1))
                     fi
                 fi
@@ -637,42 +675,42 @@ validate_chapter_files() {
             *.avif|*.AVIF)
                 hex=$(od -An -tx1 -N12 "$f" 2>/dev/null | tr -d ' \n' || echo "")
                 if [ "${hex:8:8}" != "66747970" ]; then
-                    bad+=("not an AVIF file ($f)")
+                    bad+=("$f")
                     bad_count=$((bad_count + 1))
                 fi
                 ;;
             *.jpg|*.JPG|*.jpeg|*.JPEG)
                 hex=$(od -An -tx1 -N4 "$f" 2>/dev/null | tr -d ' \n' || echo "")
                 if [ "${hex:0:4}" != "ffd8" ]; then
-                    bad+=("not a JPEG file ($f)")
+                    bad+=("$f")
                     bad_count=$((bad_count + 1))
                 fi
                 ;;
             *.png|*.PNG)
                 hex=$(od -An -tx1 -N8 "$f" 2>/dev/null | tr -d ' \n' || echo "")
                 if [ "${hex:0:16}" != "89504e470d0a1a0a" ]; then
-                    bad+=("not a PNG file ($f)")
+                    bad+=("$f")
                     bad_count=$((bad_count + 1))
                 fi
                 ;;
             *.gif|*.GIF)
                 hex=$(od -An -tx1 -N4 "$f" 2>/dev/null | tr -d ' \n' || echo "")
                 if [ "${hex:0:6}" != "474946" ]; then
-                    bad+=("not a GIF file ($f)")
+                    bad+=("$f")
                     bad_count=$((bad_count + 1))
                 fi
                 ;;
             *.pdf|*.PDF)
                 hex=$(od -An -tx1 -N4 "$f" 2>/dev/null | tr -d ' \n' || echo "")
                 if [ "${hex:0:8}" != "25504446" ]; then
-                    bad+=("not a PDF file ($f)")
+                    bad+=("$f")
                     bad_count=$((bad_count + 1))
                 fi
                 ;;
             *.cbz|*.CBZ|*.cbr|*.CBR|*.zip|*.ZIP|*.epub|*.EPUB)
                 hex=$(od -An -tx1 -N2 "$f" 2>/dev/null | tr -d ' \n' || echo "")
                 if [ "${hex:0:4}" != "504b" ]; then
-                    bad+=("not a ZIP archive ($f)")
+                    bad+=("$f")
                     bad_count=$((bad_count + 1))
                 fi
                 ;;
@@ -680,11 +718,16 @@ validate_chapter_files() {
     done < <(find "$dir" -type f -print0 2>/dev/null)
 
     if [ "$bad_count" -gt 0 ]; then
-        log_error "Corrupt chapter — not linking: $book / $name ($bad_count bad file(s))"
-        local b
-        for b in "${bad[@]}"; do
-            log_error "    $b"
+        if [ "$unreadable" -gt 0 ]; then
+            log_error "Unreadable chapter — not linked: $book / $chapter ($unreadable of $bad_count file(s) could not be READ — storage problem, not a bad download)"
+        else
+            log_error "Corrupt chapter — not linked: $book / $chapter ($bad_count bad file(s))"
+        fi
+        local ex="" b
+        for b in "${bad[@]:0:3}"; do
+            ex="$ex, $(basename "$b")"
         done
+        log_error "    first bad files:${ex#, }"
         return 1
     fi
     return 0
@@ -811,9 +854,15 @@ sync_series() {
     local last_progress=0
     local syncing_logged=0
     local -A seen_chapter=()
+    local -A skip_chapter=()
 
     for src_file in "${src_files[@]}"; do
-        local rel="${src_file#$src/}"
+        # Quote "$src" so it is matched LITERALLY. Without the quotes bash
+        # treats the directory name as a glob pattern, and a name containing
+        # brackets (e.g. "Naruto Novels [VIZ Media] [LuCaZ]") becomes a
+        # character class — the prefix then fails to match, rel keeps the
+        # whole absolute path, and the chapter name ends up empty.
+        local rel="${src_file#"$src"/}"
 
         # Split into dir portion (sanitize) and file portion (keep as-is).
         # The chapter folder part comes from the chapter map so that seasons and
@@ -835,8 +884,47 @@ sync_series() {
             if [ -n "${CHAP_SKIP["$chap"]:-}" ]; then
                 continue
             fi
-            if ! validate_chapter_files "$src/$chap" "$dst" "$chap"; then
+
+            # === PER-CHAPTER FAST PATH ===
+            # If the destination already holds exactly as many files as the
+            # source chapter, and no source file is newer than the destination
+            # directory, the per-file loop would find nothing to do. A find+wc
+            # costs two C-speed passes instead of a stat() per file — on a book
+            # with 20k pages that is the difference between seconds and minutes.
+            # A renamed chapter does not match here (its destination path does
+            # not exist yet), so renames still take the slow path.
+            local chap_dst="$dst/${CHAP_DST["$chap"]:-}"
+            if [ -n "$chap_dst" ] && [ -d "$chap_dst" ]; then
+                local scount dcount
+                scount=$(find "$src/$chap" -type f 2>/dev/null | wc -l)
+                dcount=$(find "$chap_dst" -type f 2>/dev/null | wc -l)
+                if [ "$scount" -gt 0 ] && [ "$scount" -eq "$dcount" ] && \
+                   [ -z "$(find "$src/$chap" -newer "$chap_dst" -type f -print -quit 2>/dev/null)" ]; then
+                    skip_chapter["$chap"]=1
+                    continue
+                fi
+            fi
+
+            # === KNOWN FAILURE: skip silently if nothing changed ===
+            # A chapter that already failed validation is not linked, so it has
+            # no destination folder and the fast path never applies to it. Track
+            # the failure with a marker file so the error is reported once and
+            # the chapter is re-checked only when its source actually changes.
+            local flag known_m cur_m
+            flag="$(failed_flag_path "$chap")"
+            if [ -f "$flag" ]; then
+                known_m=$(cat "$flag" 2>/dev/null)
+                cur_m=$(newest_mtime "$src/$chap")
+                if [ "$known_m" = "$cur_m" ]; then
+                    skip_chapter["$chap"]=1
+                    continue
+                fi
+            fi
+
+            if ! validate_chapter_files "$src/$chap" "$(basename "$dst")" "${CHAP_DST["$chap"]:-${chap}}"; then
                 CHAP_SKIP["$chap"]=1
+                mkdir -p "$FAILED_DIR"
+                newest_mtime "$src/$chap" > "$flag" 2>/dev/null
                 continue
             fi
             # Replacement detection: if the destination's first file points at a
@@ -847,7 +935,7 @@ sync_series() {
             local rep_src rep_rel rep_dir rep_dst
             rep_src=$(find "$src/$chap" -type f -print -quit 2>/dev/null)
             if [ -n "$rep_src" ]; then
-                rep_rel="${rep_src#$src/}"
+                rep_rel="${rep_src#"$src"/}"
                 rep_dir=$(dirname "$rep_rel")
                 rep_dst="$dst"
                 if [ "$rep_dir" != "." ]; then
@@ -869,6 +957,9 @@ sync_series() {
             fi
         fi
         if [ -n "$chap" ] && [ -n "${CHAP_SKIP["$chap"]:-}" ]; then
+            continue
+        fi
+        if [ -n "$chap" ] && [ -n "${skip_chapter["$chap"]:-}" ]; then
             continue
         fi
 
