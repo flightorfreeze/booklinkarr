@@ -816,14 +816,21 @@ sync_series() {
     [ ! -d "$src" ] && return 0
 
     # === FAST PATH: skip per-file iteration if src hasn't changed since last sync ===
-    # Cache file mtime marks the last sync time. If no source file is newer than
-    # that, nothing changed since last sync and we can skip the per-file loop.
-    # What this catches (slow path): new chapter folders, in-chapter file mods.
-    # What it misses (cache hit): src deletions → caught by PURGE_ORPHANS instead.
+    # The cache file's mtime marks the last scan. A book can be skipped only when
+    # BOTH of these hold:
+    #   - no source file is newer than the cache (nothing was added or changed)
+    #   - the destination holds the same number of files as the source
+    # The second check matters: the destination can be emptied or left at an
+    # old path (e.g. the naming scheme changed) while the source is untouched,
+    # and without it the cache would skip the book forever.
     local cache_file="$STAT_CACHE_DIR/$(printf '%s' "$dst" | tr '/' '_').cache"
     if [ -f "$cache_file" ]; then
         local cache_age=$(( $(date +%s) - $(stat -c %Y "$cache_file") ))
+        local src_total dst_total
+        src_total=$(find "$src" -type f 2>/dev/null | wc -l)
+        dst_total=$(find "$dst" -type f 2>/dev/null | wc -l)
         if [ "$cache_age" -le "$STAT_CACHE_MAX_AGE" ] && \
+           [ "$src_total" -eq "$dst_total" ] && \
            [ -z "$(find "$src" -newer "$cache_file" -type f -print -quit 2>/dev/null)" ]; then
             if should_log_skip "$dst"; then
                 log_info "✓ Cache hit: $dst"

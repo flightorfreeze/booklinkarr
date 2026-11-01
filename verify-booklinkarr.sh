@@ -336,6 +336,34 @@ else
     echo "    OK   flat book file was not linked"
 fi
 echo ""
+
+echo "================================================================"
+echo "4e. CACHE HIT MUST NOT SKIP A BOOK WITH A MISSING DESTINATION"
+echo "================================================================"
+# The destination can be emptied or left at an old path while the source is
+# untouched. The book-level cache must not skip the book in that case.
+CH="$TMPD/cachetest"
+mkdir -p "$CH/src/Book/Book_Alpha_Chapter 1"
+cp "$VD/good.webp" "$CH/src/Book/Book_Alpha_Chapter 1/001.webp"
+sync_series "$CH/src" "$CH/dst" >/dev/null 2>&1
+if [ -e "$CH/dst/Chapter 1/001.webp" ]; then
+    echo "    OK   first sync linked the chapter"
+else
+    echo "    FAIL first sync did not link the chapter"
+    lfail=1
+fi
+# Empty the destination, leave the source alone — simulates a naming change
+# stranding a book, or the destination being deleted underneath us.
+rm -rf "$CH/dst"
+sync_series "$CH/src" "$CH/dst" >/dev/null 2>&1
+if [ -e "$CH/dst/Chapter 1/001.webp" ]; then
+    echo "    OK   destination re-created even though the source was unchanged"
+else
+    echo "    FAIL destination was NOT re-created (cache hit skipped it)"
+    lfail=1
+fi
+echo ""
+
 if [ -d "$SRC_ROOT" ] && [ -d "$DST_ROOT" ]; then
     printf '  %-34s %8s %8s\n' "book" "new" "orphan"
     printf '  %-34s %8s %8s\n' "----------------------------------" "--------" "--------"
