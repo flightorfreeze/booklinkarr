@@ -279,11 +279,14 @@ echo "4c. VALIDATION 'LOG ONCE' BEHAVIOUR"
 echo "================================================================"
 # A corrupt chapter must be reported once, then skipped silently on later
 # scans until its source changes.
+# NOTE: sync_series takes the BOOK directory; the chapter is a subdirectory of
+# it. Passing the chapter dir directly would leave the chapter map empty and
+# validation would never run.
 CF="$TMPD/corruptbook"
-mkdir -p "$CF/src/Book_Alpha_Chapter 1"
-printf 'NOTAWEBPFILE' > "$CF/src/Book_Alpha_Chapter 1/001.webp"
-out1=$(sync_series "$CF/src/Book_Alpha_Chapter 1" "$CF/dst" 2>&1)
-out2=$(sync_series "$CF/src/Book_Alpha_Chapter 1" "$CF/dst" 2>&1)
+mkdir -p "$CF/src/Book/Book_Alpha_Chapter 1"
+printf 'NOTAWEBPFILE' > "$CF/src/Book/Book_Alpha_Chapter 1/001.webp"
+out1=$(sync_series "$CF/src/Book" "$CF/dst" 2>&1)
+out2=$(sync_series "$CF/src/Book" "$CF/dst" 2>&1)
 c1=$(printf '%s' "$out1" | grep -c "Corrupt chapter")
 c2=$(printf '%s' "$out2" | grep -c "Corrupt chapter")
 if [ "$c1" -eq 1 ] && [ "$c2" -eq 0 ]; then
@@ -300,8 +303,8 @@ else
     echo "    OK   corrupt chapter was not linked"
 fi
 # Touching the source must make it report again.
-printf 'ALSO NOT A WEBP' > "$CF/src/Book_Alpha_Chapter 1/002.webp"
-out3=$(sync_series "$CF/src/Book_Alpha_Chapter 1" "$CF/dst" 2>&1)
+printf 'ALSO NOT A WEBP' > "$CF/src/Book/Book_Alpha_Chapter 1/002.webp"
+out3=$(sync_series "$CF/src/Book" "$CF/dst" 2>&1)
 c3=$(printf '%s' "$out3" | grep -c "Corrupt chapter")
 if [ "$c3" -eq 1 ]; then
     echo "    OK   reports again after the source changes"
@@ -312,8 +315,27 @@ fi
 echo ""
 
 echo "================================================================"
-echo "5. WHAT WOULD CHANGE ON DEPLOY (per book)"
+echo "4d. BOOK WITH NO CHAPTER SUBDIRS (whole-book validation)"
 echo "================================================================"
+# Files sitting directly in the book directory have no chapter to hang
+# validation off, so the book itself is validated as one unit.
+BF="$TMPD/flatbook"
+mkdir -p "$BF/src"
+printf 'NOTAWEBPFILE' > "$BF/src/v01.epub"
+outf=$(sync_series "$BF/src" "$BF/dst" 2>&1)
+if printf '%s' "$outf" | grep -q "Corrupt chapter"; then
+    echo "    OK   flat book validated and refused"
+else
+    echo "    FAIL flat book was not validated"
+    lfail=1
+fi
+if [ -e "$BF/dst/v01.epub" ]; then
+    echo "    FAIL flat book file was linked despite failing validation"
+    lfail=1
+else
+    echo "    OK   flat book file was not linked"
+fi
+echo ""
 if [ -d "$SRC_ROOT" ] && [ -d "$DST_ROOT" ]; then
     printf '  %-34s %8s %8s\n' "book" "new" "orphan"
     printf '  %-34s %8s %8s\n' "----------------------------------" "--------" "--------"

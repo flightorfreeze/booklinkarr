@@ -605,10 +605,12 @@ map_rel_dir() {
     fi
 }
 
-# Newest mtime (epoch seconds) among the files under a directory.
+# Newest mtime among the files under a directory, at sub-second precision.
+# Whole-second granularity is not enough here: a chapter that is re-downloaded
+# within the same second as the previous failure must still register as changed.
 newest_mtime() {
     find "$1" -type f -printf '%T@\n' 2>/dev/null \
-        | awk 'BEGIN { m = 0 } { if ($1 + 0 > m) m = $1 + 0 } END { printf "%d", m }'
+        | awk 'BEGIN { m = 0 } { if ($1 + 0 > m) m = $1 + 0 } END { printf "%.6f", m }'
 }
 
 # Marker file recording that a chapter failed validation, holding the newest
@@ -842,6 +844,21 @@ sync_series() {
     # Build the per-book chapter map: decides each chapter's destination path,
     # handles season renumbering, side stories and chapter replacement.
     build_chapter_map "$src"
+
+    # A book whose files sit directly in the book directory (no chapter
+    # subfolders) would never be validated, because validation runs per chapter.
+    # Treat the whole book as one unit in that case.
+    local book_has_chapters=0 d
+    while IFS= read -r d; do
+        book_has_chapters=1
+        break
+    done < <(find "$src" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
+    if [ "$book_has_chapters" -eq 0 ]; then
+        if ! validate_chapter_files "$src" "$(basename "$dst")" "(whole book)"; then
+            log_error "  Skipping the entire book — it was not linked"
+            return 0
+        fi
+    fi
 
     # Remove destination folders that the current naming scheme replaces.
     cleanup_legacy_paths "$src" "$dst"
